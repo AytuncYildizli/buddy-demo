@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Buddy companion server for Core2 demo.
-
-MBP'de:
-    pip3 install flask
-    python3 server.py
-
-Sonra telefondan veya Core2'den <MBP_IP>:8080 acilir.
-"""
+"""Buddy companion server v0.3 — Core2 + Claude Code hook."""
 import json
 import time
 from flask import Flask, jsonify, request, Response
@@ -17,57 +10,66 @@ state = {
     "approved": 0,
     "denied": 0,
     "tokens": 0,
+    "today": 0,
     "mood": 5,
     "energy": 5,
     "level": 0,
     "napped": "0h00m",
     "last_activity": time.time(),
     "last_feed": time.time(),
+    "day_start": time.time(),
 }
 
 def recalc():
     now = time.time()
-    # Energy: her 30sn yemek yemezse 1 dusur
     hunger_elapsed = now - state["last_feed"]
     state["energy"] = max(0, 5 - int(hunger_elapsed / 30))
-
-    # Mood: approved/denied oranindan
+    
     total = state["approved"] + state["denied"]
     if total > 0:
         ratio = state["approved"] / total
         state["mood"] = max(1, min(5, int(ratio * 5)))
     else:
         state["mood"] = 5
-
-    # Level: her 5 approved = 1 level
+    
     state["level"] = state["approved"] // 5
-
-    # Napped
+    
     idle = int(now - state["last_activity"])
     state["napped"] = f"{idle//3600}h{(idle%3600)//60:02d}m"
+    
+    # Reset 'today' at midnight-ish (every 24h)
+    if now - state["day_start"] > 86400:
+        state["today"] = 0
+        state["day_start"] = now
 
 @app.route("/state")
 def get_state():
     recalc()
-    out = {k: v for k, v in state.items() if k not in ("last_activity", "last_feed")}
-    return jsonify(out)
+    return jsonify({k: v for k, v in state.items() 
+                    if k not in ("last_activity", "last_feed", "day_start")})
 
 @app.route("/approve", methods=["POST", "GET"])
 def approve():
     state["approved"] += 1
+    state["today"] += 1
     state["last_activity"] = time.time()
     return jsonify({"ok": True, "approved": state["approved"]})
 
 @app.route("/deny", methods=["POST", "GET"])
 def deny():
     state["denied"] += 1
+    state["today"] += 1
     state["last_activity"] = time.time()
     return jsonify({"ok": True, "denied": state["denied"]})
 
 @app.route("/tokens", methods=["POST"])
 def tokens():
     data = request.get_json(silent=True) or {}
-    state["tokens"] += data.get("count", 100)
+    # Accept absolute count or delta
+    if "set" in data:
+        state["tokens"] = data["set"]
+    else:
+        state["tokens"] += data.get("count", 100)
     state["last_activity"] = time.time()
     return jsonify({"ok": True, "tokens": state["tokens"]})
 
@@ -92,43 +94,42 @@ def sleep():
 @app.route("/reset", methods=["POST", "GET"])
 def reset():
     state.update({
-        "approved": 0, "denied": 0, "tokens": 0,
-        "mood": 5, "energy": 5, "level": 0,
-        "napped": "0h00m",
-        "last_activity": time.time(),
-        "last_feed": time.time(),
+        "approved": 0, "denied": 0, "tokens": 0, "today": 0,
+        "mood": 5, "energy": 5, "level": 0, "napped": "0h00m",
+        "last_activity": time.time(), "last_feed": time.time(),
+        "day_start": time.time(),
     })
     return jsonify({"ok": True})
 
 @app.route("/")
 def index():
     recalc()
+    safe_state = {k: v for k, v in state.items() 
+                  if k not in ("last_activity", "last_feed", "day_start")}
     html = f"""
-    <!doctype html>
-    <html><head><meta charset="utf-8"><title>Buddy Control</title>
+    <!doctype html><html><head><meta charset="utf-8"><title>Buddy</title>
+    <meta http-equiv="refresh" content="2">
     <style>
-    body {{ font-family: -apple-system; background:#111; color:#eee; padding:20px; }}
-    button {{ padding:14px 22px; margin:6px; font-size:16px; border-radius:10px; border:0; cursor:pointer; }}
+    body{{font-family:-apple-system,monospace;background:#0f0f14;color:#FD7C20;padding:24px;max-width:600px;margin:auto}}
+    h1{{color:#FD7C20}}
+    pre{{background:#1a1a22;padding:14px;border-radius:8px;color:#eee;overflow:auto}}
+    button{{padding:14px 22px;margin:6px;font-size:16px;border-radius:10px;border:0;cursor:pointer;font-weight:600}}
     .ok{{background:#2a9d2a;color:white}} .bad{{background:#c33;color:white}}
-    .warn{{background:#e69500;color:white}} pre{{background:#222;padding:12px;border-radius:8px}}
+    .warn{{background:#e69500;color:white}} .neu{{background:#444;color:white}}
     </style></head><body>
-    <h1>🐱 Buddy Control Panel</h1>
-    <pre>{json.dumps({k:v for k,v in state.items() if k not in ('last_activity','last_feed')}, indent=2)}</pre>
-    <button class="ok" onclick="fetch('/approve',{{method:'POST'}}).then(()=>location.reload())">✅ Approve</button>
-    <button class="bad" onclick="fetch('/deny',{{method:'POST'}}).then(()=>location.reload())">❌ Deny</button>
-    <button class="warn" onclick="fetch('/feed',{{method:'POST'}}).then(()=>location.reload())">🍔 Feed</button>
-    <button onclick="fetch('/pet',{{method:'POST'}}).then(()=>location.reload())">💝 Pet</button>
-    <button onclick="fetch('/reset',{{method:'POST'}}).then(()=>location.reload())">🔄 Reset</button>
-    <p><small>Auto refresh every 2s...</small></p>
-    <script>setTimeout(()=>location.reload(), 2000)</script>
+    <h1>🐱 buddy control</h1>
+    <pre>{json.dumps(safe_state, indent=2)}</pre>
+    <button class="ok" onclick="fetch('/approve',{{method:'POST'}}).then(()=>location.reload())">✅ approve</button>
+    <button class="bad" onclick="fetch('/deny',{{method:'POST'}}).then(()=>location.reload())">❌ deny</button>
+    <button class="warn" onclick="fetch('/feed',{{method:'POST'}}).then(()=>location.reload())">🍔 feed</button>
+    <button onclick="fetch('/pet',{{method:'POST'}}).then(()=>location.reload())">💝 pet</button>
+    <button class="neu" onclick="fetch('/reset',{{method:'POST'}}).then(()=>location.reload())">🔄 reset</button>
     </body></html>
     """
     return Response(html, mimetype="text/html")
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("Buddy server starting on 0.0.0.0:8080")
-    print("Telefondan: http://<MBP_IP>:8080")
-    print("IP bulmak icin: ifconfig | grep 'inet 192'")
+    print("Buddy server v0.3 on 0.0.0.0:8080")
     print("=" * 50)
     app.run(host="0.0.0.0", port=8080, debug=False)
