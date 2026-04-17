@@ -31,12 +31,35 @@ struct BuddyState {
   int energy = 5;
   int level = 0;
   String nappedFor = "0h00m";
-  
+
   // v1.0 additions
-  int burn_rate = 0;       // tokens/sec recent (for breathing)
-  bool thinking = false;   // claude is thinking (mid-tool-call)
-  String last_event = "";  // "approve","deny","session_start","session_end","tool_start"
+  int burn_rate = 0;
+  bool thinking = false;
+  String last_event = "";
   unsigned long last_event_time = 0;
+
+  // v2.0 MCP bridge additions
+  bool tea_active = false;
+  String halo_override = "";     // empty = no override
+  // active_event
+  bool has_event = false;
+  String event_message = "";
+  String event_emoji = "";
+  String event_halo = "";
+  // active_confirm
+  bool has_confirm = false;
+  String confirm_id = "";
+  String confirm_action = "";
+  float confirm_hold_seconds = 2.0;
+  float confirm_progress = 0.0;
+  String confirm_status = "";
+  // active_ask
+  bool has_ask = false;
+  String ask_id = "";
+  String ask_question = "";
+  String ask_choices[4];
+  int ask_choices_count = 0;
+  String ask_status = "";
 };
 
 BuddyState buddy;
@@ -67,6 +90,17 @@ M5Canvas canvas(&M5.Display);
 
 int tokenHistory[32];
 int histIdx = 0;
+
+// v2.0 — tea time NTP state
+bool ntpSynced = false;
+int lastTeaCheckHour = -1;
+unsigned long localTeaUntil = 0;  // millis() deadline for local tea mode
+
+// v2.0 — confirm hold tracking
+bool confirmHolding = false;
+
+// v2.0 — banner auto-clear timer
+unsigned long bannerHideAt = 0;
 
 // ================ Evolution stages ================
 // 0-10: egg
@@ -139,19 +173,27 @@ void reactEvolution() {
 }
 
 // ================ RGB halo ================
+// Color name -> RGB565
+uint16_t colorNameToRGB(const String& name) {
+  if (name == "red")    return RED_;
+  if (name == "green")  return GRN_;
+  if (name == "yellow") return YEL_;
+  if (name == "blue")   return BLU_;
+  if (name == "orange") return 0xFC60;  // orange
+  if (name == "purple") return 0x780F;  // purple
+  if (name == "white")  return TXT;
+  return BLU_;  // default
+}
+
 void setHalo(uint8_t r, uint8_t g, uint8_t b) {
-  // Core2 has side RGB LEDs via M5.Display.touch? No — it's the AtomS3 thing.
-  // Actual Core2 has small RGB on power button area only.
-  // If available via M5 API:
-  #ifdef ARDUINO_M5Stack_Core_ESP32
-  // not all cores have this
-  #endif
-  // Fallback: use screen border color as halo simulation
   canvas.drawRect(0, 0, 320, 240, (r >> 3 << 11) | (g >> 2 << 5) | (b >> 3));
   canvas.drawRect(1, 1, 318, 238, (r >> 3 << 11) | (g >> 2 << 5) | (b >> 3));
 }
 
 uint16_t haloColorForState() {
+  // v2.0: halo_override takes priority
+  if (buddy.halo_override.length() > 0) return colorNameToRGB(buddy.halo_override);
+  if (buddy.tea_active || localTeaUntil > millis()) return 0xFC60;  // orange for tea
   if (sadTicks > 0) return RED_;
   if (shakeTicks > 0) return GRN_;
   if (buddy.thinking) return YEL_;
@@ -298,6 +340,116 @@ void drawBuddyBody(int cx, int cy, float breath, int stage, bool blinking, bool 
   }
 }
 
+// ================ v2.0 Overlay Draws ================
+
+void drawEventBanner() {
+  // Top banner: emoji + message for ~5s
+  if (!buddy.has_event) return;
+  canvas.fillRect(0, 0, 320, 30, 0x1082);  // dark header
+  canvas.drawRect(0, 0, 320, 30, colorNameToRGB(buddy.event_halo));
+  canvas.setTextColor(TXT, 0x1082);
+  canvas.setTextSize(1);
+  String banner = buddy.event_emoji + " " + buddy.event_message;
+  if (banner.length() > 36) banner = banner.substring(0, 36);
+  canvas.setCursor(6, 10);
+  canvas.print(banner);
+}
+
+void drawConfirmScreen() {
+  canvas.fillSprite(BG);
+  uint16_t halo = RED_;
+  canvas.drawRect(0, 0, 320, 240, halo);
+  canvas.drawRect(1, 1, 318, 238, halo);
+
+  canvas.setTextColor(TXT, BG);
+  canvas.setTextSize(2);
+  canvas.setCursor(12, 20);
+  canvas.print("HOLD TO CONFIRM");
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(FG, BG);
+  canvas.setCursor(12, 48);
+  String act = buddy.confirm_action;
+  if (act.length() > 38) act = act.substring(0, 38);
+  canvas.print(act);
+
+  // Progress bar
+  int barW = 296;
+  int barX = 12, barY = 80;
+  canvas.drawRect(barX, barY, barW, 24, DIM);
+  int filled = (int)(buddy.confirm_progress * barW);
+  if (filled > 0) canvas.fillRect(barX, barY, filled, 24, GRN_);
+
+  canvas.setTextColor(TXT, BG);
+  canvas.setCursor(12, 115);
+  canvas.printf("%.0f%%  (hold %.0fs)", buddy.confirm_progress * 100, buddy.confirm_hold_seconds);
+
+  canvas.setTextColor(DIM, BG);
+  canvas.setCursor(12, 200);
+  canvas.print("hold screen to confirm   tap X to deny");
+
+  canvas.pushSprite(0, 0);
+}
+
+void drawAskScreen() {
+  canvas.fillSprite(BG);
+  uint16_t halo = YEL_;
+  canvas.drawRect(0, 0, 320, 240, halo);
+  canvas.drawRect(1, 1, 318, 238, halo);
+
+  canvas.setTextColor(TXT, BG);
+  canvas.setTextSize(1);
+  canvas.setCursor(12, 12);
+  String q = buddy.ask_question;
+  if (q.length() > 38) q = q.substring(0, 38);
+  canvas.print(q);
+
+  int n = buddy.ask_choices_count;
+  if (n > 4) n = 4;
+  for (int i = 0; i < n; i++) {
+    int y = 50 + i * 42;
+    canvas.fillRoundRect(12, y, 296, 34, 6, 0x2104);
+    canvas.drawRoundRect(12, y, 296, 34, 6, YEL_);
+    canvas.setTextColor(TXT, 0x2104);
+    canvas.setCursor(20, y + 12);
+    canvas.printf("%d. %s", i + 1, buddy.ask_choices[i].substring(0, 30).c_str());
+  }
+
+  canvas.pushSprite(0, 0);
+}
+
+void drawTeaBanner() {
+  // Tea overlay at top with steam animation
+  canvas.fillRect(0, 0, 320, 36, 0x7800);  // dark orange
+  canvas.drawRect(0, 0, 320, 36, 0xFC60);
+  canvas.setTextColor(TXT, 0x7800);
+  canvas.setTextSize(1);
+  canvas.setCursor(10, 4);
+  canvas.print("CAY SAATI! \xE2\x98\x95");  // ☕ fallback
+  // Simple steam chars at different heights
+  int steamPhase = (millis() / 300) % 3;
+  canvas.setCursor(180, 2 + steamPhase * 2);
+  canvas.print("~");
+  canvas.setCursor(195, 4 - steamPhase);
+  canvas.print("~");
+  canvas.setCursor(210, 2 + steamPhase);
+  canvas.print("~");
+  canvas.setCursor(10, 22);
+  canvas.print("Break time! Away from keyboard :)");
+}
+
+// ================ HTTP helper (POST with JSON body) ================
+void postJSON(const String& path, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(2000);
+  http.begin(String(SERVER_URL) + path);
+  http.addHeader("Content-Type", "application/json");
+  http.POST(body);
+  http.end();
+}
+
 // ================ Pages ================
 void drawPage1() {
   canvas.fillSprite(BG);
@@ -441,8 +593,30 @@ void drawPage2() {
 }
 
 void drawUI() {
+  // v2.0: priority overlays (replace entire UI)
+  bool teaMode = buddy.tea_active || (localTeaUntil > millis());
+
+  if (buddy.has_confirm && buddy.confirm_status == "pending") {
+    drawConfirmScreen();
+    return;
+  }
+  if (buddy.has_ask && buddy.ask_status == "pending") {
+    drawAskScreen();
+    return;
+  }
+
+  // Normal pages
   if (page == 0) drawPage1();
   else drawPage2();
+
+  // Overlay banners (drawn on top of normal pages)
+  if (teaMode) {
+    drawTeaBanner();
+    canvas.pushSprite(0, 0);
+  } else if (buddy.has_event && millis() < bannerHideAt) {
+    drawEventBanner();
+    canvas.pushSprite(0, 0);
+  }
 }
 
 // ================ Networking ================
@@ -455,11 +629,12 @@ void fetchState() {
   int code = http.GET();
   if (code == 200) {
     String body = http.getString();
-    StaticJsonDocument<768> doc;
+    // v2.0: larger doc for new fields
+    DynamicJsonDocument doc(2048);
     if (!deserializeJson(doc, body)) {
       int newApproved = doc["approved"] | 0;
       int newDenied = doc["denied"] | 0;
-      
+
       buddy.approved = newApproved;
       buddy.denied = newDenied;
       buddy.tokens = doc["tokens"] | 0;
@@ -471,23 +646,72 @@ void fetchState() {
       buddy.burn_rate = doc["burn_rate"] | 0;
       buddy.thinking = doc["thinking"] | false;
       String newEvent = String((const char*)(doc["last_event"] | ""));
-      
+
+      // v2.0 fields
+      buddy.tea_active = doc["tea_active"] | false;
+      buddy.halo_override = doc["halo_override"].isNull() ? "" : String((const char*)doc["halo_override"]);
+
+      // active_event
+      if (!doc["active_event"].isNull()) {
+        buddy.has_event = true;
+        buddy.event_message = String((const char*)(doc["active_event"]["message"] | ""));
+        buddy.event_emoji   = String((const char*)(doc["active_event"]["emoji"]   | ""));
+        buddy.event_halo    = String((const char*)(doc["active_event"]["halo_color"] | "blue"));
+        bannerHideAt = millis() + (unsigned long)(doc["active_event"]["ttl"].as<float>() * 1000);
+      } else {
+        buddy.has_event = false;
+      }
+
+      // active_confirm
+      if (!doc["active_confirm"].isNull()) {
+        buddy.has_confirm = true;
+        buddy.confirm_id            = String((const char*)(doc["active_confirm"]["id"] | ""));
+        buddy.confirm_action        = String((const char*)(doc["active_confirm"]["action"] | "confirm"));
+        buddy.confirm_hold_seconds  = doc["active_confirm"]["hold_seconds"] | 2.0;
+        buddy.confirm_progress      = doc["active_confirm"]["hold_progress"] | 0.0;
+        buddy.confirm_status        = String((const char*)(doc["active_confirm"]["status"] | "pending"));
+      } else {
+        if (buddy.has_confirm && buddy.confirm_status == "pending") {
+          // no longer pending — was confirmed/denied/timeout
+          confirmHolding = false;
+        }
+        buddy.has_confirm = false;
+        buddy.confirm_status = "";
+      }
+
+      // active_ask
+      if (!doc["active_ask"].isNull()) {
+        buddy.has_ask = true;
+        buddy.ask_id       = String((const char*)(doc["active_ask"]["id"] | ""));
+        buddy.ask_question = String((const char*)(doc["active_ask"]["question"] | ""));
+        buddy.ask_status   = String((const char*)(doc["active_ask"]["status"] | "pending"));
+        JsonArray cArr = doc["active_ask"]["choices"].as<JsonArray>();
+        buddy.ask_choices_count = 0;
+        for (JsonVariant v : cArr) {
+          if (buddy.ask_choices_count >= 4) break;
+          buddy.ask_choices[buddy.ask_choices_count++] = String((const char*)v);
+        }
+      } else {
+        buddy.has_ask = false;
+        buddy.ask_status = "";
+      }
+
       // Record history
       tokenHistory[histIdx] = buddy.burn_rate > 0 ? buddy.burn_rate : buddy.tokens;
       histIdx = (histIdx + 1) % 32;
-      
+
       // REACT to state changes
       if (newApproved > lastApproved) reactApproved();
       if (newDenied > lastDenied) reactDenied();
-      
+
       // Level-up detection
       if (buddy.level > prevLevel && prevLevel > 0) reactEvolution();
       prevLevel = buddy.level;
-      
+
       lastApproved = newApproved;
       lastDenied = newDenied;
-      
-      // Event-based reactions (from server)
+
+      // Event-based reactions
       if (newEvent != lastEvent && newEvent != "") {
         if (newEvent == "session_start") reactSessionStart();
         else if (newEvent == "session_end") reactSessionEnd();
@@ -516,20 +740,20 @@ void setup() {
   M5.Speaker.setVolume(0);  // MUTED — change to 180 for sound
   M5.Display.setRotation(1);
   M5.Display.fillScreen(BG);
-  
+
   canvas.createSprite(320, 240);
   canvas.fillSprite(BG);
   canvas.setTextColor(TXT, BG);
   canvas.setTextSize(2);
   canvas.setCursor(40, 90);
-  canvas.println("buddy v1.0");
+  canvas.println("buddy v2.0");
   canvas.setTextSize(1);
   canvas.setCursor(40, 120);
   canvas.printf("wifi: %s", WIFI_SSID);
   canvas.setCursor(40, 140);
   canvas.print("I feel what Claude feels.");
   canvas.pushSprite(0, 0);
-  
+
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries++ < 60) {
@@ -538,81 +762,147 @@ void setup() {
     canvas.print(".");
     canvas.pushSprite(0, 0);
   }
-  
+
   if (WiFi.status() == WL_CONNECTED) {
+    // NTP sync for tea time
+    configTime(3 * 3600, 0, "pool.ntp.org", "time.nist.gov");  // UTC+3 (Turkey)
+    canvas.setCursor(40, 180);
+    canvas.print("syncing NTP...");
+    canvas.pushSprite(0, 0);
+    // wait up to 5s for NTP
+    for (int i = 0; i < 20; i++) {
+      time_t now;
+      time(&now);
+      if (now > 1000000000UL) { ntpSynced = true; break; }
+      delay(250);
+    }
     reactSessionStart();
   }
-  
+
   for (int p = 0; p < 12; p++) particles[p].life = 0;
   for (int i = 0; i < 32; i++) tokenHistory[i] = 0;
-  
+
   prevLevel = 0;
 }
 
 void loop() {
   M5.update();
-  
+
   // Poll state every 1s (faster for reactivity)
   if (millis() - lastPoll > 1000) {
     fetchState();
     lastPoll = millis();
   }
-  
+
+  // v2.0: local 16:00 tea check via NTP
+  if (ntpSynced) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      if (timeinfo.tm_hour == 16 && timeinfo.tm_min == 0 && lastTeaCheckHour != 16) {
+        // Fire tea time! — firmware-side, no server dependency
+        localTeaUntil = millis() + 120000UL;  // 2 minutes
+        M5.Speaker.tone(880, 100);
+        delay(100);
+        M5.Speaker.tone(1100, 100);
+        lastTeaCheckHour = 16;
+      } else if (timeinfo.tm_hour != 16) {
+        lastTeaCheckHour = timeinfo.tm_hour;  // reset so next 16:00 triggers
+      }
+    }
+  }
+
   // Breathing phase — rate depends on burn_rate
-  // idle: 0.05, light: 0.1, heavy: 0.25
   float breathSpeed = 0.05 + (buddy.burn_rate / 100.0) * 0.2;
   if (breathSpeed > 0.3) breathSpeed = 0.3;
   breathPhase += breathSpeed;
-  
+
   // Blink counter
   blinkCounter++;
   if (blinkCounter > 250) blinkCounter = 0;
-  
+
   // Decay reaction ticks
   if (shakeTicks > 0) shakeTicks--;
   if (sadTicks > 0) sadTicks--;
   if (purrTicks > 0) purrTicks--;
   if (evolutionTicks > 0) evolutionTicks--;
-  
+
   drawUI();
-  
-  // Buttons
-  if (M5.BtnA.wasPressed()) {
-    postAction("/feed");
-    M5.Speaker.tone(1760, 80);
-    spawnHearts(2);
+
+  // Buttons (existing — only active when not in confirm/ask overlays)
+  if (!buddy.has_confirm && !buddy.has_ask) {
+    if (M5.BtnA.wasPressed()) {
+      postAction("/feed");
+      M5.Speaker.tone(1760, 80);
+      spawnHearts(2);
+    }
+    if (M5.BtnB.wasPressed()) {
+      postAction("/pet");
+      M5.Speaker.tone(1320, 80);
+      spawnHearts(3);
+    }
+    if (M5.BtnC.wasPressed()) {
+      page = (page + 1) % TOTAL_PAGES;
+      M5.Speaker.tone(660, 60);
+    }
   }
-  if (M5.BtnB.wasPressed()) {
-    postAction("/pet");
-    M5.Speaker.tone(1320, 80);
-    spawnHearts(3);
-  }
-  if (M5.BtnC.wasPressed()) {
-    page = (page + 1) % TOTAL_PAGES;
-    M5.Speaker.tone(660, 60);
-  }
-  
-  // Capacitive touch — split screen into regions
+
+  // Capacitive touch
   auto touch = M5.Touch.getDetail();
+
+  // ---- v2.0: CONFIRM hold UI ----
+  if (buddy.has_confirm && buddy.confirm_status == "pending") {
+    bool isPressed = touch.isPressed();
+    if (isPressed && !confirmHolding) {
+      confirmHolding = true;
+      postJSON("/confirm/ack/" + buddy.confirm_id, "{\"action\":\"hold_start\"}");
+    } else if (!isPressed && confirmHolding) {
+      confirmHolding = false;
+      postJSON("/confirm/ack/" + buddy.confirm_id, "{\"action\":\"hold_release\"}");
+    }
+    // Deny: tap top-left corner
+    if (touch.wasPressed() && touch.x < 40 && touch.y < 40) {
+      confirmHolding = false;
+      postJSON("/confirm/ack/" + buddy.confirm_id, "{\"action\":\"deny\"}");
+    }
+    delay(30);
+    return;
+  }
+
+  // ---- v2.0: ASK tap UI ----
+  if (buddy.has_ask && buddy.ask_status == "pending") {
+    if (touch.wasPressed()) {
+      int tx = touch.x, ty = touch.y;
+      int n = buddy.ask_choices_count;
+      if (n > 4) n = 4;
+      for (int i = 0; i < n; i++) {
+        int rowY = 50 + i * 42;
+        if (ty >= rowY && ty < rowY + 34) {
+          String body = String("{\"selected_index\":") + i + "}";
+          postJSON("/ask/answer/" + buddy.ask_id, body);
+          M5.Speaker.tone(1320, 80);
+          break;
+        }
+      }
+    }
+    delay(30);
+    return;
+  }
+
+  // ---- Normal touch handling ----
   if (touch.wasPressed()) {
     int tx = touch.x, ty = touch.y;
-    // Top-right corner (page indicator area) = swap page
     if (tx > 240 && ty < 40) {
       page = (page + 1) % TOTAL_PAGES;
       M5.Speaker.tone(660, 60);
-    }
-    // Buddy body (left half, middle) = purr
-    else if (tx < 140 && ty > 60 && ty < 200) {
+    } else if (tx < 140 && ty > 60 && ty < 200) {
       reactPurr();
       postAction("/pet");
       spawnHearts(5);
-    }
-    // Right side tap = next page too (anywhere right half, upper area)
-    else if (tx > 180 && ty < 100) {
+    } else if (tx > 180 && ty < 100) {
       page = (page + 1) % TOTAL_PAGES;
       M5.Speaker.tone(660, 60);
     }
   }
-  
+
   delay(30);  // ~33fps
 }
