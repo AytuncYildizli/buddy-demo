@@ -6,9 +6,9 @@
 #include <ArduinoJson.h>
 
 // ==== EDIT BUNU (3 satir) ====
-const char* WIFI_SSID = "AYTUNC_HOTSPOT";
-const char* WIFI_PASS = "12345678";
-const char* SERVER_URL = "http://172.20.10.1:8080";  // iPhone hotspot default gateway
+const char* WIFI_SSID = "Ayfon";
+const char* WIFI_PASS = "password123";
+const char* SERVER_URL = "http://172.20.10.2:8080";  // MBP on iPhone hotspot
 // =============================
 
 struct BuddyState {
