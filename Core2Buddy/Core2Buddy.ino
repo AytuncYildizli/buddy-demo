@@ -513,7 +513,7 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Speaker.begin();
-  M5.Speaker.setVolume(180);
+  M5.Speaker.setVolume(0);  // MUTED — change to 180 for sound
   M5.Display.setRotation(1);
   M5.Display.fillScreen(BG);
   
