@@ -592,15 +592,25 @@ void loop() {
     M5.Speaker.tone(660, 60);
   }
   
-  // Capacitive touch — tap buddy = purr
+  // Capacitive touch — split screen into regions
   auto touch = M5.Touch.getDetail();
   if (touch.wasPressed()) {
     int tx = touch.x, ty = touch.y;
-    // Buddy body is around (70, 120)
-    if (abs(tx - 70) < 50 && abs(ty - 120) < 60) {
+    // Top-right corner (page indicator area) = swap page
+    if (tx > 240 && ty < 40) {
+      page = (page + 1) % TOTAL_PAGES;
+      M5.Speaker.tone(660, 60);
+    }
+    // Buddy body (left half, middle) = purr
+    else if (tx < 140 && ty > 60 && ty < 200) {
       reactPurr();
       postAction("/pet");
       spawnHearts(5);
+    }
+    // Right side tap = next page too (anywhere right half, upper area)
+    else if (tx > 180 && ty < 100) {
+      page = (page + 1) % TOTAL_PAGES;
+      M5.Speaker.tone(660, 60);
     }
   }
   
