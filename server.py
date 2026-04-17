@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Buddy server v1.0 — Physical reactivity + breathing-from-tokens + events."""
+"""Buddy server v2.0 — Physical reactivity + breathing + events + MCP bridge support."""
 import json
 import time
+import uuid
 from collections import deque
 from flask import Flask, jsonify, request, Response
 
@@ -17,6 +18,14 @@ state = {
     "last_event": "", "last_event_time": 0,
     "thinking": False,
     "burn_rate": 0,  # tokens/sec
+
+    # v2.0: MCP bridge support
+    "events": [],            # list of recent events (max 5)
+    "halo_override": None,   # color string or None
+    "halo_override_until": 0,
+    "confirm_pending": {},   # {id: {action, hold_seconds, ttl, status, created_at, hold_start_time, hold_progress}}
+    "ask_pending": {},       # {id: {question, choices, ttl, status, selected_index, created_at}}
+    "tea_mode_until": 0,
 }
 
 # Token samples for burn rate calc (last 30s)
@@ -69,8 +78,47 @@ def recalc():
 @app.route("/state")
 def get_state():
     recalc()
+    now = time.time()
+
+    # Compute active event (most recent non-expired)
+    active_event = None
+    for evt in reversed(state["events"]):
+        if now < evt["expires_at"]:
+            active_event = evt
+            break
+
+    # Compute active confirm (oldest pending non-expired)
+    active_confirm = None
+    for cid, entry in state["confirm_pending"].items():
+        if entry["status"] == "pending" and now < entry["expires_at"]:
+            active_confirm = {"id": cid, **entry}
+            break
+
+    # Compute active ask
+    active_ask = None
+    for aid, entry in state["ask_pending"].items():
+        if entry["status"] == "pending" and now < entry["expires_at"]:
+            active_ask = {"id": aid, **entry}
+            break
+
+    # Halo override
+    halo_override = None
+    if state["halo_override"] and now < state["halo_override_until"]:
+        halo_override = state["halo_override"]
+
+    # Tea active
+    tea_active = now < state["tea_mode_until"]
+
     out = {k: v for k, v in state.items()
-           if k not in ("last_activity", "last_feed", "day_start", "last_event_time")}
+           if k not in (
+               "last_activity", "last_feed", "day_start", "last_event_time",
+               "halo_override_until", "confirm_pending", "ask_pending",
+           )}
+    out["tea_active"] = tea_active
+    out["halo_override"] = halo_override
+    out["active_event"] = active_event
+    out["active_confirm"] = active_confirm
+    out["active_ask"] = active_ask
     return jsonify(out)
 
 @app.route("/approve", methods=["POST", "GET"])
@@ -143,8 +191,197 @@ def reset():
         "last_activity": time.time(), "last_feed": time.time(),
         "day_start": time.time(), "last_event": "",
         "thinking": False, "burn_rate": 0,
+        "events": [], "halo_override": None, "halo_override_until": 0,
+        "confirm_pending": {}, "ask_pending": {}, "tea_mode_until": 0,
     })
     token_samples.clear()
+    return jsonify({"ok": True})
+
+
+# =============================================================================
+# v2.0 MCP Bridge Endpoints
+# =============================================================================
+
+@app.route("/event", methods=["POST"])
+def post_event():
+    """Push a transient notification/event. Used by MCP bridge and auth-halo."""
+    data = request.get_json(silent=True) or {}
+    topic       = data.get("topic", "")
+    message     = data.get("message", "")
+    emoji       = data.get("emoji", "📢")
+    halo_color  = data.get("halo_color", "blue")
+    ttl_seconds = int(data.get("ttl_seconds", 5))
+
+    now = time.time()
+    evt = {
+        "topic": topic,
+        "message": message,
+        "emoji": emoji,
+        "halo_color": halo_color,
+        "ttl": ttl_seconds,
+        "created_at": now,
+        "expires_at": now + ttl_seconds,
+    }
+    state["events"].append(evt)
+    # Keep only last 5
+    state["events"] = state["events"][-5:]
+
+    # Apply halo override
+    state["halo_override"] = halo_color
+    state["halo_override_until"] = now + ttl_seconds
+
+    fire_event(f"event:{topic}")
+    return jsonify({"ok": True})
+
+
+@app.route("/confirm/request", methods=["POST"])
+def confirm_request():
+    """Request physical hold-to-confirm from user."""
+    data = request.get_json(silent=True) or {}
+    action       = data.get("action", "confirm")
+    hold_seconds = float(data.get("hold_seconds", 2))
+    ttl          = float(data.get("ttl", 15))
+
+    request_id = str(uuid.uuid4())
+    now = time.time()
+    state["confirm_pending"][request_id] = {
+        "action": action,
+        "hold_seconds": hold_seconds,
+        "ttl": ttl,
+        "status": "pending",
+        "created_at": now,
+        "expires_at": now + ttl,
+        "hold_start_time": None,
+        "hold_accumulated": 0.0,
+        "hold_progress": 0.0,
+    }
+    fire_event("confirm_request")
+    return jsonify({"ok": True, "request_id": request_id})
+
+
+@app.route("/confirm/status/<confirm_id>", methods=["GET"])
+def confirm_status(confirm_id):
+    """Poll confirm status. Also accepts ?id= query param for compat."""
+    confirm_id = confirm_id or request.args.get("id", "")
+    entry = state["confirm_pending"].get(confirm_id)
+    if not entry:
+        return jsonify({"error": "not found"}), 404
+
+    now = time.time()
+    # Auto-expire
+    if entry["status"] == "pending" and now > entry["expires_at"]:
+        entry["status"] = "timeout"
+
+    # Update hold progress if currently holding
+    if entry["hold_start_time"] is not None and entry["status"] == "pending":
+        elapsed = now - entry["hold_start_time"] + entry["hold_accumulated"]
+        progress = min(1.0, elapsed / entry["hold_seconds"])
+        entry["hold_progress"] = progress
+        if progress >= 1.0:
+            entry["status"] = "confirmed"
+            entry["hold_start_time"] = None
+
+    return jsonify({
+        "status": entry["status"],
+        "state": entry["status"],  # alias for core2-bridge compat
+        "hold_progress": entry["hold_progress"],
+    })
+
+
+@app.route("/confirm/ack/<confirm_id>", methods=["POST"])
+def confirm_ack(confirm_id):
+    """Firmware calls this on hold_start / hold_release / deny."""
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "")
+    entry = state["confirm_pending"].get(confirm_id)
+    if not entry:
+        return jsonify({"error": "not found"}), 404
+
+    now = time.time()
+    if action == "hold_start":
+        entry["hold_start_time"] = now
+    elif action == "hold_release":
+        if entry["hold_start_time"] is not None:
+            entry["hold_accumulated"] += now - entry["hold_start_time"]
+            entry["hold_start_time"] = None
+        progress = min(1.0, entry["hold_accumulated"] / entry["hold_seconds"])
+        entry["hold_progress"] = progress
+        if progress >= 1.0:
+            entry["status"] = "confirmed"
+    elif action == "deny":
+        entry["status"] = "denied"
+        entry["hold_start_time"] = None
+
+    return jsonify({"ok": True, "status": entry["status"]})
+
+
+@app.route("/ask", methods=["POST"])
+def post_ask():
+    """Present a multiple-choice question to the user."""
+    data = request.get_json(silent=True) or {}
+    question = data.get("question", "")
+    choices  = data.get("choices", [])
+    ttl      = float(data.get("ttl", 30))
+
+    ask_id = str(uuid.uuid4())
+    now = time.time()
+    state["ask_pending"][ask_id] = {
+        "question": question,
+        "choices": choices,
+        "ttl": ttl,
+        "status": "pending",
+        "selected_index": None,
+        "created_at": now,
+        "expires_at": now + ttl,
+    }
+    fire_event("ask")
+    return jsonify({"ok": True, "ask_id": ask_id})
+
+
+@app.route("/ask/status/<ask_id>", methods=["GET"])
+def ask_status(ask_id):
+    """Poll ask status. Also accepts ?id= query param."""
+    ask_id = ask_id or request.args.get("id", "")
+    entry = state["ask_pending"].get(ask_id)
+    if not entry:
+        return jsonify({"error": "not found"}), 404
+
+    now = time.time()
+    if entry["status"] == "pending" and now > entry["expires_at"]:
+        entry["status"] = "timeout"
+
+    return jsonify({
+        "status": entry["status"],
+        "state": entry["status"],  # alias for core2-bridge compat
+        "selected_index": entry["selected_index"],
+        "answer_index": entry["selected_index"],  # alias
+        "answer": (
+            entry["choices"][entry["selected_index"]]
+            if entry["selected_index"] is not None and entry["status"] == "answered"
+            else None
+        ),
+    })
+
+
+@app.route("/ask/answer/<ask_id>", methods=["POST"])
+def ask_answer(ask_id):
+    """Firmware calls this when user selects a choice."""
+    data = request.get_json(silent=True) or {}
+    selected_index = data.get("selected_index")
+    entry = state["ask_pending"].get(ask_id)
+    if not entry:
+        return jsonify({"error": "not found"}), 404
+
+    entry["selected_index"] = selected_index
+    entry["status"] = "answered"
+    return jsonify({"ok": True})
+
+
+@app.route("/tea", methods=["POST"])
+def tea():
+    """Activate çay saati mode for 120 seconds."""
+    state["tea_mode_until"] = time.time() + 120
+    fire_event("tea")
     return jsonify({"ok": True})
 
 @app.route("/")
@@ -185,11 +422,26 @@ def index():
     """
     return Response(html, mimetype="text/html")
 
+# Status route for GET /confirm/status (query-param compat for core2-bridge)
+@app.route("/confirm/status", methods=["GET"])
+def confirm_status_compat():
+    confirm_id = request.args.get("id", "")
+    return confirm_status(confirm_id)
+
+
+@app.route("/ask/status", methods=["GET"])
+def ask_status_compat():
+    ask_id = request.args.get("id", "")
+    return ask_status(ask_id)
+
+
 if __name__ == "__main__":
     print("=" * 50)
-    print("Buddy server v1.0 on 0.0.0.0:8080")
+    print("Buddy server v2.0 on 0.0.0.0:8080")
     print("Endpoints: /state /approve /deny /tokens")
     print("           /session-start /session-end /thinking /thinking-end")
     print("           /feed /pet /reset")
+    print("           /event /confirm/request /confirm/status/<id> /confirm/ack/<id>")
+    print("           /ask /ask/status/<id> /ask/answer/<id> /tea")
     print("=" * 50)
     app.run(host="0.0.0.0", port=8080, debug=False)
