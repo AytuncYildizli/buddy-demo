@@ -1,0 +1,48 @@
+{
+  "_comment": "Merge this into ~/.claude/settings.json",
+  "_instructions": "After setup: chmod +x ~/buddy-demo/claude-hook.sh && copy relevant hooks block below",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/buddy-demo/claude-hook.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/buddy-demo/claude-hook.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/buddy-demo/claude-hook.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/buddy-demo/claude-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
